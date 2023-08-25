@@ -1,0 +1,361 @@
+---
+title: "FFPE_imputation"
+author: "Fares Burwag"
+date: "30/06/2023"
+output: html_document
+---
+
+```{r setup}
+#| message: false
+#| warning: false
+##########################################################################################
+library('tidyverse')
+# library('iq')
+library('RColorBrewer')
+library('pheatmap')
+library("limma")
+library("pcaMethods",mask.ok = F)
+library("missForest")
+library("imputeLCMD")
+library("foreach")
+library("doParallel")
+library("grid")
+library("gridExtra")
+
+```
+
+Only run the chunk below if you do not have the reportParsedIqQuant.tsv file generated. It takes a while to run...
+
+```{r}
+##########################################################################################
+##first we can filter and parse the report data into a better format for IQ
+raw = read_tsv('../fullFFPECohortHSJBCC/report.tsv', show_col_types = FALSE) %>%
+  dplyr::mutate(File.Name = sub('.*faresFfpeTissue[A-Za-z]*_(.*)_dia_[123]\\.raw', '\\1', File.Name)) %>%
+  dplyr::filter(Q.Value <= 0.01)
+
+##save the data
+write.table(raw, '../reportParsed.tsv', 
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = '\t')
+
+
+##run the IQ analysis
+iqResult = process_long_format('../reportParsed.tsv', 
+                           output_filename = '../reportParsedIqQuant.tsv',
+                           annotation_col = 'Genes',
+                           normalization = 'median',
+                           filter_double_less = c("Q.Value" = "0.01", "PG.Q.Value" = "0.01"),
+                           peptide_extractor = function(x) gsub("[0-9].*$", "", x))
+
+##parse the IQ result
+proData = read_tsv('../reportParsedIqQuant.tsv', show_col_types = FALSE) %>%
+  dplyr::rename(accession = 'Protein.Group',
+                symbol = 'Genes')
+
+
+##save the data
+saveRDS(proData,file = "./parsedRDSFile.rds")
+write.table(proData, "processedRDS.rds.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = '\t')
+```
+
+Start running code here unless you want to regenerate protein report file.
+
+```{r}
+# Reading in parsed report file
+proData <- read_rds("parsedRDSFile.rds")
+
+
+proData_withMissing <- proData[,5:ncol(proData)] %>%
+  as.data.frame()
+
+## Remove samples with excessive missing values (only keep samples where > 50% of genes are detected)
+naFreqperSample <- apply(is.na(proData_withMissing), 2, function(x){sum(!x)/length(x)})
+naFreqperSample_names <- names(naFreqperSample)
+naFreqperSample_values <- unname(naFreqperSample)
+naFreqperSample_threshold <- naFreqperSample_names[naFreqperSample_values >= 0.65]
+
+row.names(proData_withMissing) <- proData$accession
+proData_withMissing <- proData_withMissing[,naFreqperSample_threshold]
+
+## Remove any genes where all samples have NA. Necessary for BPCA to work
+proData_withMissing <- proData_withMissing[rowSums(!is.na(proData_withMissing)) > 0,]
+
+```
+
+```{r}
+
+
+knnTn_proDatawM <- proData_withMissing  %>%
+  rownames_to_column("accession")
+
+# To create a validation dataset to determine best K, lets introduce a few
+# artifical NAs in the lowest 10% proteins in each sample
+knnTn_proDataSimulatedNAs <- knnTn_proDatawM
+denominator <- sum(knnTn_proDataSimulatedNAs[,-1] %>% apply(1, function(x) sum(!is.na(x)) >= 5))
+knnTn_proDataSimulatedNAs[,-1] <- knnTn_proDataSimulatedNAs[,-1] %>% apply(2, function(x) replace(x, sample(which((!is.na(x) & x<=quantile(x, 0.05, na.rm = TRUE, names = FALSE))),size = 100), NA))
+numerator <- sum(knnTn_proDataSimulatedNAs[,-1] %>% apply(1, function(x) sum(!is.na(x)) >= 5))
+numerator/denominator
+
+knnTn_proDataSimulatedNAs <- knnTn_proDataSimulatedNAs[knnTn_proDataSimulatedNAs[,-1] %>% apply(1, function(x) sum(!is.na(x)) >= 5),]
+
+
+```
+
+Naive methods that infer no information from global or local data structures (simply use a single constant or a randomly generated value)
+
+```{r}
+
+# Testing out naive methods for imputation - NA to 0, SampMin, and MinProb
+naive_proDatawM <- knnTn_proDataSimulatedNAs
+
+# NA's to 0
+toZero_naiveSupplemented_proData <- naive_proDatawM
+toZero_naiveSupplemented_proData[is.na(toZero_naiveSupplemented_proData)] <- 0
+
+# NA's to SampMin
+sampMin_naiveSupplemented_proData <- naive_proDatawM
+sampMin_naiveSupplemented_proData[,-1] <- apply(sampMin_naiveSupplemented_proData[,-1], 2,
+                                                function(x) ifelse(is.na(x), min(x, na.rm = T), x))
+
+# NA's to minProb (select randomly form lowest 1% of data)
+minProb_naiveSupplemented_proData <- naive_proDatawM
+minProb_naiveSupplemented_proData[,-1] <- apply(minProb_naiveSupplemented_proData[,-1], 2,
+                                                function(x) replace(x, is.na(x),sample(x[!is.na(x) & x<=quantile(x, 0.01, na.rm = TRUE, names = FALSE)],sum(is.na(x)), replace = TRUE)))
+
+```
+
+```{r}
+
+### Testing out KNN-TN to impute
+
+# Assuming we want to test out k = 1 to k = 7, we need to select genes with at 
+# least 5 nonNA samples. To be safe, lets set threshold at 10
+
+tempTable <- knnTn_proDatawM[knnTn_proDatawM$accession %in% knnTn_proDataSimulatedNAs$accession,]
+length(tempTable[is.na(knnTn_proDataSimulatedNAs) & !is.na(tempTable)])
+# There's around 7000 datapoints to test from... good enough.
+
+# shuffledKnnTn_proDataSimulatedNAs <- knnTn_proDataSimulatedNAs[sample(1:nrow(knnTn_proDataSimulatedNAs), nrow(knnTn_proDataSimulatedNAs), replace = FALSE),]
+# shuffledKnnTn_proDataSimulatedNAs$set <- c(rep(seq(1, 4, 1), floor(nrow(shuffledKnnTn_proDataSimulatedNAs)/4)), rep(NA, 3))
+# shuffledKnnTn_proDataSimulatedNAs <- shuffledKnnTn_proDataSimulatedNAs[!is.na(shuffledKnnTn_proDataSimulatedNAs$set),]
+
+# This algorithm takes ages to run, therefore we'll select a k-value from 1 to 7 using cross validation with a split of 4.
+knnTn_performance <- tibble(k = as.numeric(NA), rmspe = as.numeric(NA), dataTibble = as.data.frame(NA))
+stored_dataPerformance <- list()
+for (k_val in seq(2, 25, 2)){
+  print(k_val)
+  loop_data <- knnTn_proDataSimulatedNAs
+  loop_data[,-1] <- imputeKNN(data = loop_data[,-1] %>% as.matrix(), k = k_val, distance = "truncation")
+  
+  completeData <- knnTn_proDatawM[knnTn_proDatawM$accession %in% loop_data$accession,]
+  predicted_values <- loop_data[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+  accurate_values <- completeData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+
+  # Get accuracy
+  rmspe_value <- sqrt(mean((as.numeric(predicted_values)-as.numeric(accurate_values))^2))
+
+  knnTn_performance <- bind_rows(knnTn_performance, tibble(k = k_val, rmspe = rmspe_value))
+  stored_dataPerformance <- append(stored_dataPerformance, loop_data)
+}
+
+knnTn_supplementedData <- knnTn_proDataSimulatedNAs
+knnTn_supplementedData[,-1] <- imputeKNN(data = knnTn_proDataSimulatedNAs[,-1] %>% as.matrix(), k = 15, distance = "truncation")
+
+## Use k = 20 - generally performs better with higher number of neighbors
+
+unique(knnTn_performance$rmspe)
+sd(completeData$BCC16, na.rm = T)
+hist((as.numer1ic(predicted_values)-as.numeric(accurate_values))^2,breaks = 1000)
+boxplot(as.numeric(proData_withMissing$BCC1), as.numeric(accurate_values), as.numeric(predicted_values))
+
+plot(x = knnTn_performance$k,y = knnTn_performance$rmspe)
+
+```
+
+
+```{r}
+
+bpca_proDataSimulatedNAs <- knnTn_proDataSimulatedNAs
+bpca_proDataSimulatedNAs <- log2(bpca_proDataSimulatedNAs[,-1])
+
+# Using Bayesian PCA to infer value of missing data based on global patterns in dataset - Takes a few minutes to run
+pc <- pca(bpca_proDataSimulatedNAs, nPcs = 10, method = "bpca")
+proData_supplemented <- completeObs(pc)
+proData_supplemented <- as.data.frame(proData_supplemented) %>%
+  map_df(function(x) 2^x)
+
+
+```
+
+```{r}
+
+# random forest
+randomForest_proDataSimulatedNAs <- knnTn_proDataSimulatedNAs
+randomForest_proDataSimulatedNAs[,-1] <- as.data.frame(log2(randomForest_proDataSimulatedNAs[,-1]))
+
+registerDoParallel(cores=8)
+rF_output <- missForest(randomForest_proDataSimulatedNAs[,-1], parallelize = "forests")
+
+rF_output <- rF_output$ximp
+rF_output_values <- as.data.frame(2^rF_output)
+
+
+```
+Visualizations to characterize the output of each imputation method
+
+```{r}
+
+## to Zero visualization
+
+allData_supplementedNAs <- knnTn_proDataSimulatedNAs %>%
+  pivot_longer(cols = 2:38, names_to = "sample", values_to = "intensity")
+# toZero_naiveSupplemented_proData[,-1][!(is.na(knnTn_proDataSimulatedNAs[,-1]) & !is.na(completeData[,-1]))]
+
+toZero_VisData <- toZero_naiveSupplemented_proData[,-1]
+toZero_VisData[!(is.na(knnTn_proDataSimulatedNAs[,-1]))] <- NA
+toZero_VisData <- toZero_VisData %>%
+  pivot_longer(cols = 1:37, names_to = "sample", values_to = "intensity") %>%
+  na.omit()
+
+toZeroVis <- ggplot()+
+  geom_boxplot(data = allData_supplementedNAs, aes(x = sample, y = intensity))+
+  geom_point(data = toZero_VisData, aes(x = sample, y = intensity), color = "red", position = "jitter", alpha = 0.002)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(x = "Sample", y = "Signal Intensity", title = "toZero Imputation")
+
+## to sample minimum visualization
+
+sampMin_VisData <- sampMin_naiveSupplemented_proData[,-1]
+sampMin_VisData[!(is.na(knnTn_proDataSimulatedNAs[,-1]))] <- NA
+sampMin_VisData <- sampMin_VisData %>%
+  pivot_longer(cols = 1:37, names_to = "sample", values_to = "intensity") %>%
+  na.omit()
+
+toSampMinVis <- ggplot()+
+  geom_boxplot(data = allData_supplementedNAs, aes(x = sample, y = intensity))+
+  geom_point(data = sampMin_VisData, aes(x = sample, y = intensity), color = "red", position = "jitter", alpha = 0.002)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(x = "Sample", y = "Signal Intensity", title = "sampleMinimum Imputation")
+
+## to minProb visualization
+
+toMinProb_VisData <- minProb_naiveSupplemented_proData[,-1]
+toMinProb_VisData[!(is.na(knnTn_proDataSimulatedNAs[,-1]))] <- NA
+toMinProb_VisData <- toMinProb_VisData %>%
+  pivot_longer(cols = 1:37, names_to = "sample", values_to = "intensity") %>%
+  na.omit()
+
+toProbMinVis <- ggplot()+
+  geom_boxplot(data = allData_supplementedNAs, aes(x = sample, y = intensity))+
+  geom_point(data = toMinProb_VisData, aes(x = sample, y = intensity), color = "red", position = "jitter", alpha = 0.002)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(x = "Sample", y = "Signal Intensity", title = "minProbability Imputation")
+
+
+## knnTruncation visualization
+
+knnTn_VisData <- knnTn_supplementedData[,-1]
+knnTn_VisData[!(is.na(knnTn_proDataSimulatedNAs[,-1]))] <- NA
+knnTn_VisData <- knnTn_VisData %>%
+  pivot_longer(cols = 1:37, names_to = "sample", values_to = "intensity") %>%
+  na.omit()
+
+toKnnTnVis <- ggplot()+
+  geom_boxplot(data = allData_supplementedNAs, aes(x = sample, y = intensity))+
+  geom_point(data = knnTn_VisData, aes(x = sample, y = intensity), color = "red", position = "jitter", alpha = 0.005)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(x = "Sample", y = "Signal Intensity", title = "kNN Truncation Imputation")
+
+## BPCA visualization
+bpca_Supplemented_proData <- bind_cols(accession = knnTn_proDataSimulatedNAs$accession, proData_supplemented)
+bpca_VisData <- bpca_Supplemented_proData[,-1]
+bpca_VisData[!(is.na(knnTn_proDataSimulatedNAs[,-1]))] <- NA
+bpca_VisData <- bpca_VisData %>%
+  pivot_longer(cols = 1:37, names_to = "sample", values_to = "intensity") %>%
+  na.omit()
+
+tobpcaVis <- ggplot()+
+  geom_boxplot(data = allData_supplementedNAs, aes(x = sample, y = intensity))+
+  geom_point(data = bpca_VisData, aes(x = sample, y = intensity), color = "red", position = "jitter", alpha = 0.005)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(x = "Sample", y = "Signal Intensity", title = "BPCA Imputation")
+
+## randomForest visualization
+
+randomForest_Supplemented_proData <- bind_cols(accession = knnTn_proDataSimulatedNAs$accession, rF_output_values)
+randomForest_VisData <- randomForest_Supplemented_proData[,-1]
+randomForest_VisData[!(is.na(knnTn_proDataSimulatedNAs[,-1]))] <- NA
+randomForest_VisData <- randomForest_VisData %>%
+  pivot_longer(cols = 1:37, names_to = "sample", values_to = "intensity") %>%
+  na.omit()
+
+toRFVis <- ggplot()+
+  geom_boxplot(data = allData_supplementedNAs, aes(x = sample, y = intensity))+
+  geom_point(data = randomForest_VisData, aes(x = sample, y = intensity), color = "red", position = "jitter", alpha = 0.005)+
+  theme(axis.text.x = element_text(angle = 45))+
+  labs(x = "Sample", y = "Signal Intensity", title = "randomForest Imputation")
+
+ggsave(filename = "imputationResultsVis.png",
+       plot = gridExtra::grid.arrange(toZeroVis, toSampMinVis, toProbMinVis, toKnnTnVis, tobpcaVis, toRFVis, nrow = 6),
+       width = 7,
+       height = 35)
+
+```
+
+
+```{r}
+
+real_values <- completeData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+toZero_predicted_values <- toZero_naiveSupplemented_proData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+toSampMin_predicted_values <- sampMin_naiveSupplemented_proData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+toMinProb_predicted_values <- minProb_naiveSupplemented_proData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+tokNNTn_predicted_values <- knnTn_supplementedData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+toBPCA_predicted_values <- bpca_Supplemented_proData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+toRF_predicted_values <- randomForest_Supplemented_proData[is.na(knnTn_proDataSimulatedNAs) & !is.na(completeData)]
+
+imputePerformance <- tibble(method_impute = c("Zero", "SampMin", "MinProb", "kNN Truncation", "BPCA", "Random Forest"),
+       RMSPE_value = c(sqrt(mean(c(as.numeric(toZero_predicted_values) - as.numeric(real_values))^2)),
+                       sqrt(mean(c(as.numeric(toSampMin_predicted_values) - as.numeric(real_values))^2)),
+                       sqrt(mean(c(as.numeric(toMinProb_predicted_values) - as.numeric(real_values))^2)),
+                       sqrt(mean(c(as.numeric(tokNNTn_predicted_values) - as.numeric(real_values))^2)),
+                       sqrt(mean(c(as.numeric(toBPCA_predicted_values) - as.numeric(real_values))^2)),
+                       sqrt(mean(c(as.numeric(toRF_predicted_values) - as.numeric(real_values))^2))
+                       ))
+
+ggplot(data = imputePerformance)+
+  geom_bar(aes(x = reorder(method_impute, RMSPE_value), y = RMSPE_value), stat = "identity", fill = "salmon")+
+  labs(x = "Imputation Method", y = "Root Mean Square Error")
+
+ggsave("imputationPerformance.png")
+
+```
+
+
+For BC Childrens, the label key is as below
+
+```{r}
+
+BCC_key <- data.frame(short_label = c("BCC1", "BCC2", "BCC3", "BCC4", "BCC5", "BCC6", "BCC7", "BCC8", "BCC9", "BCC10", "BCC11", "BCC12", "BCC13", "BCC14", "BCC15", "BCC16", "BCC17", "BCC18", "BCC19", "BCC20", "BCC21", "BCC22", "BCC23", "BCC24", "BCC25", "BCC26", "BCC27", "BCC28", "BCC29", "BCC30", "BCC31", "BCC32", "BCC33", "BCC34", "BCC35", "BCC36"), original = c("S211165D1","S21335A2", "S20749B1", "S203243C1","S212984B1", "S212818B1","S12469D1","S123607B1","S203113B2","S194826A2","S202667C10","S20228B1","S172944B3","S193365A2","S181477A2","S184058A2","S171999C1","S161352A2","S16686C1","S16486C4","S16316A2","S154448C1","S152968D2","S184465A1","S151916B2","S144474A3","S22618A2","S144473A2","S134449A2","S134324C1","S131864D1","S125789A1","S123944D5","S122751B1","S122371D2","S121B5")) %>%
+  mutate(original_dashed = sub("(S[0-9]{2})(.*)","\\1-\\2", original))
+
+batch_key <- data.frame(sample = c(unique(colnames(proData)[5:ncol(proData)]))) %>%
+  mutate(batch = case_when(grepl("hsj", sample, ignore.case = F) ~ "batchA",
+                           as.numeric(str_match(sample, "BCC(.*)")[,2]) %in% c(1:12)|grepl("HSJ", sample, ignore.case = F) ~ "batchB",
+                           as.numeric(str_match(sample, "BCC(.*)")[,2]) %in% c(13:36) ~ "batchC"),
+         sample_source = case_when(grepl("BCC", sample, ignore.case = T) ~ "BC_Children",
+                                   grepl("hsj", sample, ignore.case = T) ~ "Montreal",
+                                   TRUE ~ NA)) %>%
+  arrange(batch)
+
+# batch_key %>% group_by(batch) %>% summarize(n())
+
+```
+
+
+
+
+
+
+
+
+

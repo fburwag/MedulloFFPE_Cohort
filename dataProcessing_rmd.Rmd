@@ -1,0 +1,730 @@
+---
+title: "FFPE_report"
+author: "Fares"
+date: "2023-06-19"
+output: html_document
+---
+
+
+```{r setup}
+#| message: false
+#| warning: false
+##########################################################################################
+library('tidyverse')
+# library('iq')
+library('RColorBrewer')
+library('pheatmap')
+library("limma")
+library("broom")
+```
+
+Only run the chunk below if you do not have the reportParsedIqQuant.tsv file generated. It takes a while to run...
+
+```{r}
+##########################################################################################
+##first we can filter and parse the report data into a better format for IQ
+raw = read_tsv('../fullFFPECohortHSJBCC/report.tsv', show_col_types = FALSE) %>%
+  dplyr::mutate(File.Name = sub('.*faresFfpeTissue[A-Za-z]*_(.*)_dia_[123]\\.raw', '\\1', File.Name)) %>%
+  dplyr::filter(Q.Value <= 0.01)
+
+##save the data
+write.table(raw, '../reportParsed.tsv', 
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = '\t')
+
+
+##run the IQ analysis
+iqResult = process_long_format('../reportParsed.tsv', 
+                           output_filename = '../reportParsedIqQuant.tsv',
+                           annotation_col = 'Genes',
+                           normalization = 'median',
+                           filter_double_less = c("Q.Value" = "0.01", "PG.Q.Value" = "0.01"),
+                           peptide_extractor = function(x) gsub("[0-9].*$", "", x))
+
+##parse the IQ result
+proData = read_tsv('../reportParsedIqQuant.tsv', show_col_types = FALSE) %>%
+  dplyr::rename(accession = 'Protein.Group',
+                symbol = 'Genes')
+
+
+##save the data
+saveRDS(proData,file = "./parsedRDSFile.rds")
+write.table(proData, "processedRDS.rds.tsv",
+            col.names = TRUE, row.names = FALSE, quote = FALSE, sep = '\t')
+```
+
+Start running code here unless you want to regenerate protein report file.
+
+```{r}
+
+proData <- read_rds("parsedRDSFile.rds")
+
+```
+
+For BC Childrens, the label key is as below
+
+```{r}
+
+BCC_key <- data.frame(short_label = c("BCC1", "BCC2", "BCC3", "BCC4", "BCC5", "BCC6", "BCC7", "BCC8", "BCC9", "BCC10", "BCC11", "BCC12", "BCC13", "BCC14", "BCC15", "BCC16", "BCC17", "BCC18", "BCC19", "BCC20", "BCC21", "BCC22", "BCC23", "BCC24", "BCC25", "BCC26", "BCC27", "BCC28", "BCC29", "BCC30", "BCC31", "BCC32", "BCC33", "BCC34", "BCC35", "BCC36"), original = c("S211165D1","S21335A2", "S20749B1", "S203243C1","S212984B1", "S212818B1","S12469D1","S123607B1","S203113B2","S194826A2","S202667C10","S20228B1","S172944B3","S193365A2","S181477A2","S184058A2","S171999C1","S161352A2","S16686C1","S16486C4","S16316A2","S154448C1","S152968D2","S184465A1","S151916B2","S144474A3","S22618A2","S144473A2","S134449A2","S134324C1","S131864D1","S125789A1","S123944D5","S122751B1","S122371D2","S121B5")) %>%
+  mutate(original_dashed = sub("(S[0-9]{2})(.*)","\\1-\\2", original))
+
+batch_key <- data.frame(sample = c(unique(colnames(proData)[5:ncol(proData)]))) %>%
+  mutate(batch = case_when(grepl("hsj", sample, ignore.case = F) ~ "batchA",
+                           as.numeric(str_match(sample, "BCC(.*)")[,2]) %in% c(1:12)|grepl("HSJ", sample, ignore.case = F) ~ "batchB",
+                           as.numeric(str_match(sample, "BCC(.*)")[,2]) %in% c(13:36) ~ "batchC"),
+         sample_source = case_when(grepl("BCC", sample, ignore.case = T) ~ "BC_Children",
+                                   grepl("hsj", sample, ignore.case = T) ~ "Montreal",
+                                   TRUE ~ NA)) %>%
+  arrange(batch)
+
+# batch_key %>% group_by(batch) %>% summarize(n())
+
+```
+
+BPCA tries to fill in NA values using clustering within the data. The assumption is there are patterns in the data that can be used to supplement these missing values. A simplistic example: if a gene only has a value for 10 samples and they're all low relative to other genes (without any particular obvious correlations), then the best guess you have is the remaining samples should also have pretty low values.
+
+```{r bpca imputation method}
+
+proData_withMissing <- proData[,5:ncol(proData)] %>%
+  as.data.frame()
+
+## Remove samples with excessive missing values (only keep samples where > 60% of genes are detected)
+naFreqperSample <- apply(is.na(proData_withMissing), 2, function(x){sum(!x)/length(x)})
+naFreqperSample_names <- names(naFreqperSample)
+naFreqperSample_values <- unname(naFreqperSample)
+naFreqperSample_threshold <- naFreqperSample_names[naFreqperSample_values >= 0.6]
+
+row.names(proData_withMissing) <- proData$accession
+proData_withMissing <- proData_withMissing[,naFreqperSample_threshold]
+
+## Remove any genes where all samples have NA. Necessary for BPCA to work
+proData_withMissing <- proData_withMissing[rowSums(!is.na(proData_withMissing)) > 0,]
+
+# Using Bayesian PCA to infer value of missing data based on global patterns in dataset - Takes a few minutes to run
+pc <- pca(proData_withMissing, nPcs = 8, method = "bpca")
+proData_supplemented <- completeObs(pc)
+proData_supplemented <- as.data.frame(proData_supplemented) %>%
+  rownames_to_column("accession")
+
+proData_wM_postFilter <- proData_withMissing %>%
+  rownames_to_column("accession")
+proData_wM_postFilter <- left_join(data.frame(accession = proData_supplemented[,1]), proData_wM_postFilter)
+
+proData_supplemented <- proData_supplemented %>%
+  merge(proData[,c(1,2)])
+
+# Check row order
+sum(proData_supplemented$accession != proData_wM_postFilter$accession)
+# Check col order
+sum(colnames(proData_supplemented[,-c(1, 2)]) != colnames(proData_wM_postFilter[-c(1)]))
+```
+
+```{r Distribution of NA imputation values}
+
+proDataSupplemented_numCols <- proData_supplemented[,3:(ncol(proData_supplemented))]
+proData_wM_postFilter_numCols <- proData_wM_postFilter[,-1]
+NA_values <- proDataSupplemented_numCols[is.na(proData_wM_postFilter_numCols)]
+all_values <- unlist(proDataSupplemented_numCols, use.names = FALSE)
+detected_values <- unlist(proData_wM_postFilter_numCols, use.names = FALSE)
+
+length(NA_values)/length(all_values) # ~30% of data are NAs
+
+ggplot() +
+  # geom_density(aes(x = all_values), fill = "gray", alpha = 0.3)+
+  geom_histogram(aes(x = detected_values), fill = "blue", alpha = 0.2, binwidth = 0.15)+
+  geom_histogram(aes(x = NA_values), fill = "red", alpha = 0.2, binwidth = 0.15)+
+  labs(y = "Frequency of value", x = "Normalized signal intensity")
+
+
+
+ggplot() +
+  geom_density(aes(x = all_values), color = "black")+
+  geom_density(aes(x = detected_values), color = "blue")+
+  geom_density(aes(x = NA_values), color = "red")+
+  labs(y = "Density", x = "Normalized signal intensity")
+
+```
+
+
+Based on the bar graph below, BatchB seems to have the lowest performance. This would be worth looking into, however, it is likely due to low yield samples.
+
+```{r}
+
+# Coverage of 11,000+ unique proteins with 2+ peptides
+
+proData %>% filter(n_peptides >= 2) %>%
+  group_by(symbol) %>%
+  slice(1)
+
+unique_protein_counts <- proData %>%
+  map_df(function(x){sum(!is.na(x))}) %>%
+  pivot_longer(5:ncol(proData),names_to = "sample", values_to = "protein_count") %>%
+  merge(batch_key, all.x = T) 
+
+unique_protein_counts %>%
+  mutate(sample = factor(sample, levels = batch_key$sample)) %>%
+  ggplot(aes(x = sample, y = protein_count, fill = batch))+
+    geom_bar(stat = "identity", width = 0.8)+
+    theme(axis.text.x = element_text(angle = 45))
+
+
+```
+
+```{r}
+
+proData_batch <- proData %>% filter(n_peptides >= 2) %>%
+  pivot_longer(5:ncol(proData), names_to = "sample", values_to = "intensity") %>%
+  merge(batch_key, all.x = T)
+
+proData_batch %>%
+  ggplot()+
+  geom_boxplot(aes(x = factor(sample, batch_key$sample), y = intensity, fill = batch))+
+  theme(axis.text.x = element_text(angle = 45))
+
+boxplot(log(proData[,-c(1:4)]))
+
+```
+
+
+Correlation between quantification and number of identified proteins
+
+```{r}
+
+nanodrop_values <- data.frame(sample = c("BCC1", "BCC2", "BCC3", "BCC4", "BCC5", "BCC6", "BCC7", "BCC8", "BCC9", "BCC10", "BCC11", "BCC12", "BCC13", "BCC14", "BCC15", "BCC16", "BCC17", "BCC18", "BCC19", "BCC20", "BCC21", "BCC22", "BCC23", "BCC24", "BCC25", "BCC26", "BCC27", "BCC28", "BCC29", "BCC30", "BCC31", "BCC32", "BCC33", "BCC34", "BCC35", "BCC36", "HSJ202","HSJ226", "HSJ64", "HSJ90", "HSJ15", "HSJ150"), nanodrop = c(3.71, 0.21, 0.76,0.33, 0.91, 0.65, 1.47, 0.17, 2.6, 0.21, 1.86, 1.01, 1.33, 0.53, 0.92, 0.59, 2.21, 0.38, 1.84, 0.35,1.76,2.44,1.11,0.29,0.49,2.41,0.56,0.53,1.01,1.42,1.52,3.54,3.2,1.83,2.39,3.34,0.45,0.45,0.44,0.82,0.64,0.57))
+
+unique_protein_counts %>%
+  merge(nanodrop_values, all.x = T) %>%
+  filter(!is.na(nanodrop)) %>%
+  ggplot(aes(y = protein_count, x = nanodrop))+
+  geom_point(aes(color = sample_source))+
+  geom_vline(xintercept = 0.5)+
+  ylim(c(0, 12000))+
+  annotate(geom = "text",x = 0.57, y = 2500, label = "concentration = 0.5 mg/mL", size = 3.5, angle = 90)
+
+
+unique_protein_counts %>%
+  merge(nanodrop_values, all.x = T) %>%
+  filter(nanodrop <= 0.5) %>%
+  merge(BCC_key, by.x = "sample", by.y = "short_label") %>%
+  pull(nanodrop)
+
+```
+
+
+```{r reading in clinical info}
+
+bcch_metaRaw <- read_csv("../BCCH_metadata.csv")
+hsj_metaRaw <- read_csv("../montreal_HSJ_metadata.csv")
+
+bcch_metaTidy <- bcch_metaRaw %>% mutate(sample = gsub(" ", "", `SURG PATH #`)) %>%
+  select(sample, group)
+
+hsj_metaTidy <- hsj_metaRaw %>%
+  mutate(sample = paste0("HSJ",HSJ),
+         group = case_when(Group == 4 ~ "Group 4",
+                           Group == 3 ~ "Group 3",
+                           TRUE ~ Group)) %>%
+           select(sample, group)
+
+sample_metaTidy <- bind_rows(bcch_metaTidy, hsj_metaTidy)
+
+# All samles have been correctly labelled
+bcch_metaTidy$sample %in% BCC_key$original_dashed
+
+```
+
+No significant clustering based on batch and source
+
+```{r}
+
+# PCA plot by preparation batch
+
+ggplot(pca_plot_df, aes(x = PC1, y= PC2, color = batch))+
+  geom_point()+
+  stat_ellipse()
+
+# PCA plot by Montreal vs BCCh samples
+
+ggplot(pca_plot_df, aes(x = PC1, y= PC2, color = sample_source))+
+  geom_point()+
+  stat_ellipse()
+
+```
+
+
+
+```{r PCA using all genes without imputation and without filtering for differentially expressed genes}
+
+pca_data <- proData %>%
+  filter(n_peptides >= 2)
+
+
+pca_subdata <- pca_data[,5:ncol(pca_data)] %>%
+  as.data.frame()
+
+row.names(pca_subdata) <- pca_data$accession
+
+#Principle component analysis
+
+pca_output <- prcomp(~., pca_subdata)
+
+
+pca_plot_df <- pca_output$rotation %>% as.data.frame()
+
+pca_plot_df <- pca_plot_df %>% rownames_to_column("sample") %>%
+  arrange(sample) %>%
+  merge(batch_key)
+
+# pca_plot_df['sample_montreal'] <- grepl("hsj", pca_plot_df$sample, ignore.case = T)
+
+
+
+# PCA plot by subgroup
+pca_plot_df_subgroup <- pca_plot_df %>% 
+  merge(BCC_key, by.x = "sample", by.y = "short_label", all.x = TRUE) %>%
+  mutate(sampleID = toupper(case_when(is.na(original_dashed) ~ sample,
+                              TRUE ~ original_dashed))) %>%
+  merge(sample_metaTidy, by.x = "sampleID", by.y = "sample")
+
+ggplot(pca_plot_df_subgroup, aes(x = PC1, y= PC2, color = group))+
+  geom_point()+
+  stat_ellipse()
+
+
+```
+
+
+```{r PCA using all genes with imputation and without filtering for differentially expressed genes}
+
+# PCA analysis using imputation but without filtering for differentially expressed genes
+# Removing low-confidence proteins
+proDataSupplemented_pca <- merge(proData_supplemented, proData[,c("accession","n_peptides")], all.x = TRUE) %>% 
+  filter(n_peptides >= 2)
+
+pcaSupplemented_data <- proDataSupplemented_pca[,3:(ncol(proDataSupplemented_pca)-1)] 
+
+pcaSupplemented_data <- pcaSupplemented_data %>%
+  as.data.frame()
+
+#Principle component analysis
+
+pcaSupplemented_output <- prcomp(~., pcaSupplemented_data)
+
+
+pcaSupplemented_plot_df <- pcaSupplemented_output$rotation %>% as.data.frame()
+
+pcaSupplemented_plot_df <- pcaSupplemented_plot_df %>% rownames_to_column("sample") %>%
+  merge(BCC_key, by.x = "sample", by.y = "short_label", all.x = TRUE) %>%
+  mutate(sampleID = toupper(case_when(is.na(original_dashed) ~ sample,
+                              TRUE ~ original_dashed))) %>%
+  merge(sample_metaTidy, by.x = "sampleID", by.y = "sample")
+
+ggplot(pcaSupplemented_plot_df, aes(x = PC1, y = PC2, color = group))+
+  geom_point()+
+  stat_ellipse()
+
+```
+
+
+```{r tc archer extraction of DE genes}
+
+# Reading in TC archer contrasts (LIMMA fit object)
+tcarcher_contrasts <- read_rds("../TCArcher_contrasts.rds")
+
+subgroups <- c("GR3", "GR4", "SHH", "WNT")
+
+category_contrasts = c()
+# Designating contrasts
+category_contrasts <- combn(c(unique(subgroups)), 2) %>% apply(2, function(x){
+  append(category_contrasts, paste0(x[[1]], "-", x[[2]]))
+})
+
+# The for loop below extracts differentially expressed genes for all 12 contrasts (WNT-SHH, WNT-GR3, WNT-GR4, etc...)
+# that meet the threshold of an adjusted p-value of 0.01 and a fold change of 5.
+adj_pcut <- 0.01
+min_log2fc <- log2(5)
+
+identified_pair_hits <- data.frame()
+for (cont in category_contrasts){
+  
+  loop_table <- topTable(fit = tcarcher_contrasts, coef = cont, number = nrow(tcarcher_contrasts$coefficients),
+                         adjust.method = "BH",
+                         p.value = adj_pcut,
+                         lfc = min_log2fc)
+  
+  loop_table["gene_name"] <- row.names(loop_table)
+  row.names(loop_table) <- 1:nrow(loop_table)
+  
+  loop_table["comparison"] <- cont
+  identified_pair_hits <- bind_rows(identified_pair_hits, loop_table)
+}
+
+# For each subgroup contrast, I'm only looking at the top 200 differentially expressed genes per contrast. This reduces
+# bias in clustering towards contrasts with a greater number of differentially expressed genes.
+
+tidy_identified_pair_hits <- identified_pair_hits %>% 
+    arrange(adj.P.Val) %>%
+    group_by(comparison) %>%
+    slice(1:200)
+
+  
+# There are a total of 757 differentially expressed genes that will be used for downstream analysis
+DE_genes <- unique(tidy_identified_pair_hits$gene_name)
+  
+  
+```
+
+### Looking into distribution of missing values and DE genes
+
+```{r na count}
+
+# How many of these differentially expressed genes have missing values in the original dataset
+missingDE_table <- proData[proData[,5:58] %>% apply(1, function(x){sum(is.na(x)) > 0}),] %>%
+  filter(symbol %in% DE_genes)
+
+# Out of these 757 genes, 534 genes contain at least 1 missing value.
+
+```
+
+
+```{r na histogram}
+
+# For these 534 genes with missing values, what is the distribution of the proportion of samples with a missing value.
+missingDE_table["na_count"] <- missingDE_table %>% apply(1, function(x){sum(is.na(x))}) %>%
+  as.data.frame()
+
+missingDE_table["proportion_naSamples"] <- missingDE_table$na_count/54
+
+hist(missingDE_table$proportion_naSamples, breaks = 20)
+
+# A decent proportion of genes have NAs for over 50% of samples.
+
+```
+
+
+
+```{r pca using differentially expressed genes without imputation}
+
+
+de_pcaData <- proData[proData$symbol%in% DE_genes,] %>%
+  as.data.frame()
+
+de_pcaData_subset <- de_pcaData[,5:ncol(proData)]
+row.names(de_pcaData_subset) <- de_pcaData$symbol
+
+
+#Principle component analysis
+
+de_pca_output <- prcomp(~., de_pcaData_subset)
+
+
+de_pca_plot_df <- de_pca_output$rotation %>% as.data.frame()
+
+de_pca_plot_df <- de_pca_plot_df %>% rownames_to_column("sample") %>%
+  merge(BCC_key, by.x = "sample", by.y = "short_label", all.x = TRUE) %>%
+  mutate(sampleID = toupper(case_when(is.na(original_dashed) ~ sample,
+                              TRUE ~ original_dashed))) %>%
+  merge(sample_metaTidy, by.x = "sampleID", by.y = "sample")
+
+ggplot(de_pca_plot_df, aes(x = PC1, y = PC2, color = group))+
+  geom_point()+
+  stat_ellipse()
+
+
+```
+
+
+```{r pca using differentially expressed genes and imputation}
+# PCA analysis using imputation but without filtering for differentially expressed genes
+# Removing low-confidence proteins
+de_proDataSupplemented_pca <- merge(proData_supplemented, proData[proData$symbol %in% DE_genes,c("accession","n_peptides")], all.x = TRUE) %>% 
+  filter(n_peptides >= 2)
+
+de_pcaSupplemented_data <- de_proDataSupplemented_pca[,3:(ncol(de_proDataSupplemented_pca)-1)] 
+
+de_pcaSupplemented_data <- de_pcaSupplemented_data %>%
+  as.data.frame()
+
+
+#Principle component analysis
+
+de_pcaSupplemented_output <- prcomp(~., de_pcaSupplemented_data)
+
+
+de_pcaSupplemented_df <- de_pcaSupplemented_output$rotation %>% as.data.frame()
+
+de_pcaSupplemented_plot_df <- de_pcaSupplemented_df %>% rownames_to_column("sample") %>%
+  merge(BCC_key, by.x = "sample", by.y = "short_label", all.x = TRUE) %>%
+  mutate(sampleID = toupper(case_when(is.na(original_dashed) ~ sample,
+                              TRUE ~ original_dashed))) %>%
+  merge(sample_metaTidy, by.x = "sampleID", by.y = "sample")
+
+ggplot(de_pcaSupplemented_plot_df, aes(x = PC1, y = PC2, color = group))+
+  geom_point()+
+  stat_ellipse()
+
+
+```
+
+```{r}
+
+cBioPortal_mutations <- read_tsv("cBioPortal_alterations_across_samples.tsv")
+colnames(cBioPortal_mutations)
+
+cBioPortal_mutations %>%
+  select(!(contains("MUT") | contains("FUSION")))
+
+```
+
+```{r k-means clustering}
+
+kmeans_data <- proData_supplemented %>%
+  column_to_rownames("accession") %>%
+  select(-symbol)%>%
+  t() %>% as.data.frame() %>%
+  map_df(scale)
+
+k_val <- tibble(k = 1:15)
+kmeans_supplemented <- mutate(k_val, clusters = map(k, function(ks) kmeans(kmeans_data, ks, nstart = 20)),
+                              glanced_output = map(clusters, glance)) %>%
+  unnest(glanced_output)
+
+ggplot(kmeans_supplemented, aes(x = k, y = tot.withinss))+
+  geom_point()+
+  geom_line()
+
+
+
+```
+
+
+
+```{r k-means clustering}
+
+## A large majority of variation exists in the first four principle components
+barplot(pca_output$sdev)
+
+## Using these three components, we can try running kmeans clustering
+kmeans_data <- apply(pca_output$rotation[,1:4], 2, scale)*pca_output$sdev[1:4]
+
+## Testing out kmeans using 1 to 15 centers (sample size = 54)
+k_val <- tibble(k = 1:15)
+kmeans_pca <- mutate(k_val, clusters = map(k, function(ks) kmeans(kmeans_data, ks, nstart = 20)),
+                              glanced_output = map(clusters, glance)) %>%
+  unnest(glanced_output)
+
+## Visualizing elbow plot (total within sum of squares)
+ggplot(kmeans_pca, aes(x = k, y = tot.withinss))+
+  geom_point()+
+  geom_line()
+
+## Investigating kmeans with 6 centers
+kmeans_pca_6centers <- kmeans(kmeans_data, 6, nstart = 20)
+kmeans_pca6C_output <- augment(kmeans_pca_6centers, kmeans_data)
+kmeans_pca6C_output$sample <- row.names(pca_output$rotation)
+kmeans_pca6C_output <- kmeans_pca6C_output %>%
+  merge(BCC_key, by.x = "sample", by.y = "short_label", all.x = TRUE) %>%
+  mutate(sampleID = toupper(case_when(is.na(original_dashed) ~ sample,
+                              TRUE ~ original_dashed))) %>%
+  merge(sample_metaTidy, by.x = "sampleID", by.y = "sample") %>%
+  select(sampleID, PC1, PC2, PC3, PC4, `.cluster`, group)
+
+## Visualize clusters
+kmeans_pca6C_output %>%
+  ggplot(aes(x = PC1, y = PC2, color = `.cluster`))+
+  geom_point()+
+  stat_ellipse()+
+  lims(y = c(-10,15), x = c(-20,10))
+kmeans_pca6C_output %>%
+  ggplot(aes(x = PC1, y = PC2, color = `group`))+
+  geom_point()+
+  stat_ellipse()+
+  lims(y = c(-10,15), x = c(-20,10))
+
+kmeans_pca6C_output %>%
+  group_by(`.cluster`, group) %>%
+  summarize(count = n()) %>%
+  mutate(prop = count/sum(count)) %>%
+  arrange(`.cluster`, desc(prop))
+
+```
+
+
+
+
+### Ignore code past here
+
+```{r}
+
+normal_cerebellum <- read_tsv("../dataset_processedMbrNormalTotalProteome.tsv") %>%
+  select(1, 5, 6)
+
+proData_relabelled <- proData %>%
+  pivot_longer(5:ncol(proData), names_to = "sample", values_to = "intensity") %>%
+  merge(BCC_key, by.x = "sample", by.y = "short_label", all.x = TRUE) %>%
+  mutate(sampleID = toupper(case_when(is.na(original_dashed) ~ sample,
+                              TRUE ~ original_dashed))) %>%
+  select(2, 3, 6, 9) %>%
+  filter(sampleID %in% sample_metaTidy$sample) %>%
+  arrange(sampleID) %>%
+  pivot_wider(names_from = "sampleID", values_from = "intensity") %>%
+  merge(normal_cerebellum, by = "accession", all = TRUE)
+
+```
+
+
+```{r}
+
+proData_relabelled_long <- proData_relabelled %>%
+  pivot_longer(3:ncol(proData_relabelled), values_to = "intensity", names_to = "sample")
+
+
+ggplot(proData_relabelled_long, aes(x = sample, y = intensity))+
+  geom_boxplot()
+
+
+```
+
+Data needs to be normalized - especially the normal tissue samples
+Given the protein distribution is relatively consistent across samples, I'll simply use a median normalization.
+
+```{r normalizing data}
+
+median_markup_values <- proData_relabelled_long %>%
+  group_by(sample) %>% 
+  summarize(median_intensity = median(intensity, na.rm = T)) %>%
+  mutate(median_markup = median_intensity - max(median_intensity))
+
+proData_relabelled_lgNorm <- proData_relabelled_long %>%
+  merge(median_markup_values, all.x = TRUE) %>% 
+  mutate(normalized_intensity = intensity - median_markup)
+
+#Non-normalized intensity boxplot
+ggplot(proData_relabelled_lgNorm, aes(x = sample, y = intensity))+
+  geom_boxplot()
+
+#Normalized intensity boxplot
+ggplot(proData_relabelled_lgNorm, aes(x = sample, y = normalized_intensity))+
+  geom_boxplot()
+
+proData_relabelled_wdNorm <- proData_relabelled_lgNorm %>%
+  select(sample, accession, symbol, normalized_intensity) %>%
+  pivot_wider(names_from = "sample", values_from = "normalized_intensity")
+
+```
+
+
+```{r differential expression normal to subgorup}
+
+normMB_limma.data <- proData_relabelled_wdNorm %>%
+  select(-c(1,2)) #%>%
+  # map_df(log2)
+
+row.names(normMB_limma.data) <- proData_relabelled_wdNorm$accession
+
+
+subgroups <- filter(sample_metaTidy, sample %in% colnames(normMB_limma.data)) %>%
+  arrange(sample) %>%
+  pull(group) %>% append(c("normal", "normal"),after = -0)
+
+subgroups <- gsub("roup ", "R", subgroups)
+
+design <- model.matrix(~0+subgroups)
+colnames(design) <- gsub("subgroups", "", colnames(design))
+
+subgroup_contrasts <- c()
+for(cat in c("GR3", "GR4", "SHH", "WNT")){
+  subgroup_contrasts <- append(subgroup_contrasts, paste0("normal-",cat))
+}
+
+contrasts <- makeContrasts(contrasts = subgroup_contrasts, levels = design)
+
+normMB_limma.fit <- lmFit(normMB_limma.data, design) %>%
+  contrasts.fit(contrasts) %>%
+  eBayes()
+
+gene_key <- proData_relabelled_wdNorm[,c(1,2)]
+
+```
+
+
+```{r gsea normal to subgroup}
+
+p_val = 0.05
+fc = 2
+library('fgsea')
+
+geneset_input <- topTable(normMB_limma.fit, coef = "normal-SHH", number = 20000,p.value = p_val, fc = fc) %>%
+  mutate(score = logFC * -log10(adj.P.Val)) %>%
+  merge(gene_key, by.x = "row.names", by.y = "accession") %>%
+  select(symbol, score) %>%
+  deframe()
+
+hallmarks_geneset <- fgsea::gmtPathways("../h.all.v2023.1.Hs.symbols.gmt")
+
+fgsea(hallmarks_geneset, geneset_input) %>%
+  arrange(padj)
+
+```
+
+
+```{r Investigating Chr17}
+
+# # Existence of MYC
+# proData %>% filter(grepl("TP53",symbol, ignore.case = T))
+
+chromosome_geneset <- fgsea::gmtPathways("../c1.all.v2023.1.Hs.symbols.gmt")
+
+chr17q_genes <- c()
+chr17p_genes <- c()
+
+for (geneset_name in names(chromosome_geneset)){
+  if(grepl("chr17q", geneset_name)){
+    chr17q_genes <- append(chr17q_genes, chromosome_geneset[names(chromosome_geneset)==geneset_name][[1]])
+  } else { if(grepl("chr17p", geneset_name)){
+    chr17p_genes <- append(chr17p_genes, chromosome_geneset[names(chromosome_geneset)==geneset_name][[1]])
+  } else {}
+    }
+}
+
+
+c17parm_data <- proData %>%
+  filter(symbol %in% c(chr17q_genes)) %>%
+  mutate(arm = case_when(symbol %in% chr17q_genes ~ "q-arm"))
+  
+
+c17parm_data_clean <- select(c17parm_data, -c(1, 2, 3, 4,59)) %>%
+  map_df(function(x){ifelse(is.na(x), 8, x)}) %>%
+  as.data.frame()
+
+row.names(c17parm_data_clean) <- c17parm_data$symbol
+
+c17parm_mat <- c17parm_data_clean[,1:ncol(c17parm_data_clean)] %>% as.matrix()
+
+hmap <- pheatmap::pheatmap(c17parm_mat,
+                   annotation_row = c17parm_data %>% column_to_rownames("symbol") %>% select(arm),
+                   cellwidth = 8.5, cellheight = 8,
+                   annotation_col = de_pca_plot_df %>% select(sample, group) %>% column_to_rownames("sample"))
+
+
+ggsave("heamap.png",plot = hmap, height = 60, width = 20, limitsize = FALSE)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
